@@ -71,7 +71,7 @@ jobs:
             JSON_FLAG="--json"
           fi
 
-          python scripts/osint_bot.py \
+          python osint_bot.py \
             --target "${{ github.event.inputs.target }}" \
             --file /tmp/osint_urls.txt \
             --output-dir reports \
