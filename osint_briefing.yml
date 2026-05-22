@@ -1,0 +1,133 @@
+name: 🔍 OSINT Deep Briefing
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Target entity name (e.g. XYZ NGO, ABC Media Page)"
+        required: true
+        type: string
+
+      urls:
+        description: "URLs to scrape — one per line"
+        required: true
+        type: string
+
+      extra_context:
+        description: "Extra manual context / notes (optional)"
+        required: false
+        type: string
+        default: ""
+
+      save_json:
+        description: "Also save raw JSON output?"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write       # needed to commit report back to repo
+
+jobs:
+  briefing:
+    name: Generate Intelligence Briefing
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Checkout repo ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ─────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      # ── 4. Write URLs input to file ─────────────────────────────────────────
+      - name: Prepare URL input file
+        run: |
+          mkdir -p reports
+          printf '%s' "${{ github.event.inputs.urls }}" > /tmp/osint_urls.txt
+          echo "URLs written:"
+          cat /tmp/osint_urls.txt
+
+      # ── 5. Run OSINT bot ─────────────────────────────────────────────────────
+      - name: Run OSINT Deep Briefing Bot
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          EXTRA="${{ github.event.inputs.extra_context }}"
+          JSON_FLAG=""
+          if [ "${{ github.event.inputs.save_json }}" = "true" ]; then
+            JSON_FLAG="--json"
+          fi
+
+          python scripts/osint_bot.py \
+            --target "${{ github.event.inputs.target }}" \
+            --file /tmp/osint_urls.txt \
+            --output-dir reports \
+            --extra "$EXTRA" \
+            $JSON_FLAG
+
+      # ── 6. List generated reports ────────────────────────────────────────────
+      - name: Show generated files
+        run: |
+          echo "=== Generated Reports ==="
+          ls -lh reports/
+          echo ""
+          echo "=== Markdown Preview (first 100 lines) ==="
+          find reports -name "*.md" | head -1 | xargs head -100
+
+      # ── 7. Upload as artifact (downloadable from Actions UI) ─────────────────
+      - name: Upload briefing as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: osint-briefing-${{ github.run_number }}
+          path: reports/
+          retention-days: 90
+
+      # ── 8. Commit report back to repo ────────────────────────────────────────
+      - name: Commit briefing to repository
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add reports/
+
+          # Only commit if there are actual changes
+          if git diff --staged --quiet; then
+            echo "No new files to commit."
+          else
+            SAFE_TARGET=$(echo "${{ github.event.inputs.target }}" | tr ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-40)
+            git commit -m "🔍 OSINT briefing: ${{ github.event.inputs.target }} [run #${{ github.run_number }}]"
+            git push
+            echo "✓ Briefing committed to repo under reports/"
+          fi
+
+      # ── 9. Print summary to Actions UI ──────────────────────────────────────
+      - name: Write job summary
+        run: |
+          MD_FILE=$(find reports -name "*.md" | head -1)
+          echo "## 🔍 OSINT Deep Briefing Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Target** | ${{ github.event.inputs.target }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run** | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Report file** | \`$MD_FILE\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Report preview" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$MD_FILE" ]; then
+            head -80 "$MD_FILE" >> $GITHUB_STEP_SUMMARY
+          fi
