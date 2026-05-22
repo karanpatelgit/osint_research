@@ -50,7 +50,7 @@ jobs:
 
       # ── 3. Install dependencies ─────────────────────────────────────────────
       - name: Install dependencies
-        run: pip install -r scripts/requirements.txt
+        run: pip install -r requirements.txt
 
       # ── 4. Write URLs input to file ─────────────────────────────────────────
       - name: Prepare URL input file
