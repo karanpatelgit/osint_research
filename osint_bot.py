@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-OSINT Deep Briefing Bot
-========================
-Auto-scrapes URLs, sends to Claude API, outputs a full investigative briefing.
+OSINT Deep Briefing Engine — Content Writer Edition
+=====================================================
+Auto-scrapes URLs, analyses via Claude API, outputs investigative briefings
+in multiple formats optimised for journalists and content writers.
+
 Usage:
-    python osint_bot.py --target "Entity Name" --urls url1 url2 url3
-    python osint_bot.py --target "Entity Name" --file urls.txt
-    python osint_bot.py --target "Entity Name" --urls url1 --extra "any extra text or context"
+  python osint_bot.py --target "Entity Name" --urls url1 url2
+  python osint_bot.py --target "Entity" --file urls.txt --mode article --tone formal
+  python osint_bot.py --target "Entity" --urls url1 --angle funding --quotes --seo
+  python osint_bot.py --target "Entity" --urls url1 --legal-review --export docx
+  python osint_bot.py --target "Entity" --watchlist add
+  python osint_bot.py --target "Entity" --watchlist run
 """
 
-import os
-import sys
-import re
-import json
-import time
-import argparse
-import textwrap
+import os, sys, re, json, time, argparse, textwrap, hashlib, difflib
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -26,49 +25,95 @@ import anthropic
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-from rich.text import Text
-from rich.rule import Rule
 from rich.table import Table
+from rich.rule import Rule
 from rich import print as rprint
 
 console = Console()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SYSTEM PROMPT — The Investigative Journalist persona
+# SYSTEM PROMPTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are an elite Investigative Journalist and OSINT (Open-Source Intelligence) Expert. Your job is to dissect the provided raw internet research data about the target entity and expose the hidden network, institutional backers, and potential double standards. Do not fall for public relations (PR) spin, satire covers, or surface-level explanations. Be highly analytical, skeptical, and precise.
+BRIEFING_SYSTEM = """You are an elite Investigative Journalist and OSINT Expert. Dissect raw internet research data about the target entity and expose the hidden network, institutional backers, and potential double standards. Be highly analytical, skeptical, and precise. Do NOT hallucinate.
 
-Analyze the raw text provided and generate a "Deep Intelligence Briefing" structured exactly under these four headers. Use bullet points for high scannability.
+Generate a Deep Intelligence Briefing as a valid JSON object with exactly these keys:
+- "context": array of bullet strings — surface claims vs hidden agenda, launch timeline, triggers
+- "network": array of bullet strings — founders, directors, promoters, their political/corporate/institutional ties
+- "trail": array of bullet strings — funding, parent companies, domain ownership, operational infrastructure
+- "guns": array of bullet strings — contradictions, narrative shifts, hypocrisy, deleted post leaks
+- "quotes": array of objects {speaker, quote, date, source_url, is_direct} — verbatim or close-paraphrase quotes from key persons
+- "confidence": object mapping "context"|"network"|"trail"|"guns" to "high"|"medium"|"low" based on source quality
+- "needs_corroboration": array of strings — specific claims that require independent verification before publishing
+- "named_persons": array of strings — full names of all named individuals (for right-of-reply checklist)
+- "keywords": array of strings — 8-12 SEO keywords extracted from the briefing
+- "headline_variants": object with keys "seo", "clickable", "print", "thread_hook" each a string headline
 
-### 1. THE REIGNING CONTEXT & COVERT IDENTITY
-- Analyze what this entity claims to be on the surface or what people see (e.g., a meme page, a neutral NGO, a new startup).
-- Contrast it immediately with the actual underlying objective or hidden agenda suggested by the research data or what can be a digging point.
-- Flag the exact launch timeline or triggers and flag the events: when, why, who, how, and until when it is going on (e.g., "Founded right after X political event").
+CRITICAL RULES:
+1. STRICT FACTUAL ACCURACY — only facts directly supported by provided text. No assumptions.
+2. EXPLICIT CITATIONS — every bullet point MUST end with [Source N] matching the source index.
+3. UNKNOWN HANDLING — if data is absent, write "NO DIRECT DATA FOUND IN CURRENT SOURCES" — never fabricate.
+4. For confidence: high = multiple corroborating sources, medium = single source, low = inferred/circumstantial.
+5. For quotes: is_direct=true only if the source uses actual quotation marks around the words.
 
-### 2. THE HUMAN NETWORK & AFFILIATIONS (THE KUNDALI)
-- Extract all names of founders, co-founders, key directors, or high-profile promoters and linked persons mentioned in any related article.
-- Map out their past and present political connections or any type of connections, institutional roles, corporate ties, or previous controversial ventures.
-- Highlight any shared history between these individuals and known political strategists or powerful organizations and also check for other angles.
+Respond ONLY with a valid JSON object. No markdown fences, no preamble."""
 
-### 3. THE PAPER TRAIL & MONEY TRAIL
-- Document any mentions of funding sources, parent companies, international backing, corporate registrations, or NGO channels — even the exact context mentioned.
-- If explicit funding data is missing, identify the operational infrastructure and viewpoint (e.g., who owns the domain, who runs the physical office, which agency managed their launch campaign).
+ARTICLE_SYSTEM = """You are a senior investigative journalist writing for a national publication. 
+Given a structured OSINT briefing JSON and target entity name, write a complete investigative article.
 
-### 4. SMOKING GUNS & CONTRADICTIONS
-- Cross-reference the entity's current public stance with the past actions, historical posts, or statements of its founders.
-- Highlight any doubtful elements, sudden shifts in narrative, deleted post leaks, or hypocrisies.
+Structure:
+- HEADLINE: compelling, factual headline
+- SUBHEADLINE: one-sentence summary
+- BYLINE: "By [Investigative Desk]"
+- DATELINE: today's date + location if known
+- LEDE (2-3 sentences): the most newsworthy revelation, written to hook the reader
+- BODY (5-8 paragraphs): weave context, network, money trail, and contradictions into narrative prose
+- SIDEBAR: "Key Facts at a Glance" — 5 bullet points
+- CLOSING: future implications or unanswered questions paragraph
 
----
-CRITICAL COMPLIANCE RULES:
-1. STRICT FACTUAL ACCURACY: You are a journalist; legal risks are high. You MUST ONLY use facts directly supported by the provided raw text. Do not assume or hallucinate. Provide all references if you are taking any context.
-2. EXPLICIT CITATIONS: At the end of every single bullet point, you MUST insert the exact source marker in brackets like [Source 0] or [Source 2], matching the source index provided.
-3. UNKNOWN HANDLING: If funding or network info is completely absent from the text, explicitly state: "NO DIRECT PAPER TRAIL FOUND IN CURRENT DATA" instead of making up possibilities.
+Rules:
+- Use "alleged", "according to", "reportedly" for unverified claims
+- Attribute every specific claim to its source
+- Never editorialize without attribution
+- Write at a 10th-grade reading level unless tone=academic
+- Return as plain text (no markdown)"""
 
-Respond ONLY with a valid JSON object with exactly these four keys: "context", "network", "trail", "guns".
-Each key maps to an array of bullet point strings (plain text, no markdown inside strings).
-No markdown fences, no preamble, no explanation — pure JSON only."""
+THREAD_SYSTEM = """You are a viral investigative journalist on X (Twitter).
+Given an OSINT briefing JSON, write a numbered thread that exposes the story.
 
+Rules:
+- Tweet 1: the bombshell hook — make people stop scrolling (max 280 chars)
+- Tweets 2-10: one revelation per tweet, build tension progressively
+- Each tweet max 280 characters (count carefully)
+- End with a "THREAD SUMMARY:" tweet and a CTA
+- Use line breaks, not long paragraphs
+- No hashtags unless specifically requested
+- Return as plain numbered list"""
+
+NEWSLETTER_SYSTEM = """You are writing for an investigative newsletter with 50,000 subscribers.
+Given an OSINT briefing JSON, write a newsletter edition.
+
+Structure:
+- SUBJECT LINE: (email subject, compelling, max 60 chars)
+- PREVIEW TEXT: (email preview snippet, max 90 chars)  
+- GREETING: "Dear Reader,"
+- INTRO (2 sentences): why this story matters today
+- THE STORY (4-6 paragraphs): narrative, readable, gripping
+- WHAT TO WATCH: 3 bullet points of follow-up angles
+- SIGN-OFF: "Until next time, [The Investigative Desk]"
+
+Tone: smart, trustworthy, slightly urgent. No jargon. Return as plain text."""
+
+LEGAL_SYSTEM = """You are a media lawyer and editorial compliance expert.
+Given investigative content, rewrite it with legal risk mitigation applied.
+
+Rules:
+- Replace definitive allegations about named individuals with "alleged", "according to [source]", "reportedly", "claimed to"
+- Flag any statement that could constitute defamation (unverified factual claims about specific people)
+- Add "The [Entity/Person] did not respond to requests for comment" where relevant
+- Preserve all factual, well-sourced claims unchanged
+- Output format: same structure as input, with [LEGAL-FLAG: reason] inline where you changed something
+- Return as plain text with legal flags visible"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCRAPER
@@ -84,66 +129,114 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-def scrape_url(url: str, index: int, timeout: int = 15) -> dict:
-    """Scrape a single URL and return structured result."""
-    result = {
-        "index": index,
-        "url": url,
-        "domain": urlparse(url).netloc,
-        "title": "",
-        "text": "",
-        "status": "ok",
-        "error": None,
-        "char_count": 0,
-    }
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=timeout)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+WAYBACK_API = "http://archive.org/wayback/available?url={url}"
 
-        # Remove junk
+
+def fetch_wayback(url: str) -> str | None:
+    """Try to fetch archived version from Wayback Machine."""
+    try:
+        r = requests.get(WAYBACK_API.format(url=url), timeout=10)
+        data = r.json()
+        snapshot = data.get("archived_snapshots", {}).get("closest", {})
+        if snapshot.get("available"):
+            return snapshot["url"]
+    except Exception:
+        pass
+    return None
+
+
+def fetch_youtube_transcript(url: str) -> str | None:
+    """Extract transcript from YouTube video URL."""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        vid_match = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+        if not vid_match:
+            return None
+        vid_id = vid_match.group(1)
+        transcript = YouTubeTranscriptApi.get_transcript(vid_id)
+        return " ".join(t["text"] for t in transcript)[:15000]
+    except Exception:
+        return None
+
+
+def scrape_url(url: str, index: int, timeout: int = 15) -> dict:
+    """Scrape a single URL; fall back to Wayback if needed."""
+    result = {
+        "index": index, "url": url,
+        "domain": urlparse(url).netloc,
+        "title": "", "text": "", "status": "ok",
+        "error": None, "char_count": 0, "source_type": "web",
+        "wayback_used": False,
+    }
+
+    # YouTube shortcut
+    if "youtube.com" in url or "youtu.be" in url:
+        transcript = fetch_youtube_transcript(url)
+        if transcript:
+            result["text"] = transcript
+            result["char_count"] = len(transcript)
+            result["title"] = f"YouTube Video: {url}"
+            result["source_type"] = "youtube_transcript"
+            return result
+        result["status"] = "error"
+        result["error"] = "YouTube transcript unavailable"
+        return result
+
+    def _fetch(target_url: str) -> requests.Response:
+        return requests.get(target_url, headers=HEADERS, timeout=timeout)
+
+    try:
+        resp = _fetch(url)
+        resp.raise_for_status()
+    except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout) as e:
+        # Try Wayback fallback
+        wb_url = fetch_wayback(url)
+        if wb_url:
+            try:
+                resp = _fetch(wb_url)
+                resp.raise_for_status()
+                result["wayback_used"] = True
+                result["source_type"] = "wayback"
+            except Exception as e2:
+                result["status"] = "error"
+                result["error"] = f"{e} | Wayback also failed: {e2}"
+                return result
+        else:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+        return result
+
+    try:
+        soup = BeautifulSoup(resp.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header",
-                          "aside", "form", "noscript", "iframe", "ads",
-                          "[class*='cookie']", "[id*='cookie']"]):
+                          "aside", "form", "noscript", "iframe"]):
             tag.decompose()
 
         result["title"] = soup.title.string.strip() if soup.title else url
-
-        # Extract main content — prefer <article> or <main>, fallback to <body>
         main = soup.find("article") or soup.find("main") or soup.find("body")
         if main:
-            paragraphs = main.find_all(["p", "h1", "h2", "h3", "h4", "li", "blockquote", "td", "th"])
-            lines = []
-            for p in paragraphs:
-                text = p.get_text(separator=" ", strip=True)
-                if len(text) > 30:  # skip tiny fragments
-                    lines.append(text)
-            result["text"] = "\n".join(lines)
+            paras = main.find_all(["p", "h1", "h2", "h3", "h4", "li",
+                                    "blockquote", "td", "th"])
+            lines = [p.get_text(separator=" ", strip=True)
+                     for p in paras if len(p.get_text(strip=True)) > 30]
+            result["text"] = "\n".join(lines)[:15000]
         else:
-            result["text"] = soup.get_text(separator="\n", strip=True)
+            result["text"] = soup.get_text(separator="\n", strip=True)[:15000]
 
-        # Truncate to ~15k chars per source to avoid token bloat
-        result["text"] = result["text"][:15000]
         result["char_count"] = len(result["text"])
-
-    except requests.exceptions.Timeout:
-        result["status"] = "timeout"
-        result["error"] = f"Request timed out after {timeout}s"
-    except requests.exceptions.HTTPError as e:
-        result["status"] = "http_error"
-        result["error"] = str(e)
-    except requests.exceptions.ConnectionError:
-        result["status"] = "connection_error"
-        result["error"] = "Could not connect to host"
     except Exception as e:
-        result["status"] = "error"
+        result["status"] = "parse_error"
         result["error"] = str(e)
 
     return result
 
 
-def scrape_all(urls: list[str]) -> list[dict]:
-    """Scrape all URLs with progress display."""
+def scrape_all(urls: list[str], timeout: int = 15) -> list[dict]:
     results = []
     with Progress(
         SpinnerColumn(),
@@ -155,137 +248,250 @@ def scrape_all(urls: list[str]) -> list[dict]:
         task = progress.add_task("sources...", total=len(urls))
         for i, url in enumerate(urls):
             progress.update(task, description=f"[dim]{urlparse(url).netloc}[/dim]")
-            result = scrape_url(url, i)
-            results.append(result)
-            time.sleep(0.8)  # polite crawl delay
+            results.append(scrape_url(url, i, timeout=timeout))
+            time.sleep(0.6)
             progress.advance(task)
     return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAUDE ANALYSIS
+# CLAUDE CALLS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_user_message(target: str, scraped: list[dict], extra: str = "") -> str:
-    """Build the user message with all scraped sources labeled."""
-    lines = [f"TARGET ENTITY: {target}", "", "RAW RESEARCH DATA:", ""]
+def build_briefing_prompt(target: str, scraped: list[dict], extra: str,
+                           angle: str | None) -> str:
+    lines = [f"TARGET ENTITY: {target}", ""]
+    if angle:
+        lines += [f"FOCUS ANGLE: {angle} — prioritise findings related to this angle.", ""]
 
+    lines += ["RAW RESEARCH DATA:", ""]
     for s in scraped:
         lines.append(f"[Source {s['index']}] URL: {s['url']}")
         lines.append(f"Domain: {s['domain']}")
+        if s.get("wayback_used"):
+            lines.append("Note: fetched from Wayback Machine archive")
         if s["title"]:
             lines.append(f"Title: {s['title']}")
         if s["status"] == "ok":
-            lines.append(f"Content ({s['char_count']} chars):")
-            lines.append(s["text"])
+            lines.append(f"Content ({s['char_count']} chars):\n{s['text']}")
         else:
             lines.append(f"[SCRAPE FAILED: {s['error']}]")
-        lines.append("")
-        lines.append("─" * 60)
-        lines.append("")
+        lines += ["", "─" * 60, ""]
 
     if extra.strip():
-        lines.append(f"[Extra Context / Manual Notes]")
-        lines.append(extra.strip())
-        lines.append("")
+        lines += [f"[Extra Context / Manual Notes]", extra.strip(), ""]
 
     lines.append("Generate the full Deep Intelligence Briefing JSON now.")
     return "\n".join(lines)
 
 
-def run_analysis(target: str, user_message: str, api_key: str) -> dict:
-    """Send to Claude API and parse JSON response."""
-    client = anthropic.Anthropic(api_key=api_key)
-
-    console.print("\n[bold red]◌[/bold red] Transmitting to Claude API...", end=" ")
-
-    message = client.messages.create(
+def call_claude(system: str, user: str, client: anthropic.Anthropic,
+                max_tokens: int = 4096) -> tuple[str, object]:
+    msg = client.messages.create(
         model="claude-opus-4-5",
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user}],
     )
+    text = "".join(b.text for b in msg.content if hasattr(b, "text"))
+    return text, msg.usage
 
-    console.print("[green]RECEIVED[/green]")
 
-    raw_text = "".join(
-        block.text for block in message.content if hasattr(block, "text")
-    )
-
-    # Strip markdown fences if model disobeyed
-    clean = re.sub(r"```json|```", "", raw_text).strip()
-
+def parse_json_response(raw: str) -> dict:
+    clean = re.sub(r"```json|```", "", raw).strip()
     try:
-        parsed = json.loads(clean)
+        return json.loads(clean)
     except json.JSONDecodeError:
-        # Try to extract JSON object
         match = re.search(r"\{[\s\S]*\}", clean)
         if match:
-            parsed = json.loads(match.group())
-        else:
-            raise ValueError(f"Could not parse model response as JSON.\nRaw:\n{clean[:500]}")
+            return json.loads(match.group())
+        raise ValueError(f"Could not parse JSON.\nRaw (first 500):\n{clean[:500]}")
 
-    return parsed, message.usage
+
+def run_briefing(target: str, prompt: str, client: anthropic.Anthropic) -> tuple[dict, object]:
+    console.print("\n[bold red]◌[/bold red] Phase 2 — Analysing with Claude...", end=" ")
+    raw, usage = call_claude(BRIEFING_SYSTEM, prompt, client)
+    console.print("[green]DONE[/green]")
+    return parse_json_response(raw), usage
+
+
+def run_article(briefing: dict, target: str, tone: str, client: anthropic.Anthropic) -> str:
+    console.print("[bold red]◌[/bold red] Drafting article...", end=" ")
+    user = f"TARGET: {target}\nTONE: {tone}\n\nBRIEFING JSON:\n{json.dumps(briefing, indent=2)}"
+    raw, _ = call_claude(ARTICLE_SYSTEM, user, client, max_tokens=3000)
+    console.print("[green]DONE[/green]")
+    return raw
+
+
+def run_thread(briefing: dict, target: str, client: anthropic.Anthropic) -> str:
+    console.print("[bold red]◌[/bold red] Writing thread...", end=" ")
+    user = f"TARGET: {target}\n\nBRIEFING JSON:\n{json.dumps(briefing, indent=2)}"
+    raw, _ = call_claude(THREAD_SYSTEM, user, client, max_tokens=2000)
+    console.print("[green]DONE[/green]")
+    return raw
+
+
+def run_newsletter(briefing: dict, target: str, client: anthropic.Anthropic) -> str:
+    console.print("[bold red]◌[/bold red] Writing newsletter...", end=" ")
+    user = f"TARGET: {target}\n\nBRIEFING JSON:\n{json.dumps(briefing, indent=2)}"
+    raw, _ = call_claude(NEWSLETTER_SYSTEM, user, client, max_tokens=2500)
+    console.print("[green]DONE[/green]")
+    return raw
+
+
+def run_legal_review(content: str, client: anthropic.Anthropic) -> str:
+    console.print("[bold red]◌[/bold red] Legal compliance review...", end=" ")
+    raw, _ = call_claude(LEGAL_SYSTEM, content, client, max_tokens=3000)
+    console.print("[green]DONE[/green]")
+    return raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OUTPUT RENDERER
+# WATCHLIST
+# ─────────────────────────────────────────────────────────────────────────────
+
+WATCHLIST_FILE = Path("./output/watchlist.json")
+
+def watchlist_load() -> dict:
+    if WATCHLIST_FILE.exists():
+        return json.loads(WATCHLIST_FILE.read_text())
+    return {}
+
+def watchlist_save(data: dict):
+    WATCHLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WATCHLIST_FILE.write_text(json.dumps(data, indent=2))
+
+def watchlist_add(target: str, urls: list[str]):
+    wl = watchlist_load()
+    wl[target] = {"urls": urls, "added": datetime.now().isoformat(), "runs": []}
+    watchlist_save(wl)
+    console.print(f"[green]✓[/green] Added [bold]{target}[/bold] to watchlist with {len(urls)} URL(s)")
+
+def watchlist_list():
+    wl = watchlist_load()
+    if not wl:
+        console.print("[dim]Watchlist is empty.[/dim]")
+        return
+    t = Table(show_header=True, header_style="bold dim", box=None)
+    t.add_column("Entity", style="white", width=30)
+    t.add_column("URLs", width=8)
+    t.add_column("Runs", width=8)
+    t.add_column("Last run", width=20)
+    for name, data in wl.items():
+        last = data["runs"][-1]["at"] if data["runs"] else "Never"
+        t.add_row(name, str(len(data["urls"])), str(len(data["runs"])), last)
+    console.print(t)
+
+def compute_delta(old_briefing: dict, new_briefing: dict) -> dict:
+    """Return only changed/added/removed bullet points between two briefings."""
+    delta = {}
+    for key in ["context", "network", "trail", "guns"]:
+        old_set = set(old_briefing.get(key, []))
+        new_set = set(new_briefing.get(key, []))
+        added = list(new_set - old_set)
+        removed = list(old_set - new_set)
+        if added or removed:
+            delta[key] = {"added": added, "removed": removed}
+    return delta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RENDERERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 SECTION_META = [
-    ("01", "context", "THE REIGNING CONTEXT & COVERT IDENTITY",      "red"),
-    ("02", "network", "THE HUMAN NETWORK & AFFILIATIONS (THE KUNDALI)", "yellow"),
-    ("03", "trail",   "THE PAPER TRAIL & MONEY TRAIL",                "cyan"),
-    ("04", "guns",    "SMOKING GUNS & CONTRADICTIONS",                "magenta"),
+    ("01", "context", "THE REIGNING CONTEXT & COVERT IDENTITY",        "red"),
+    ("02", "network", "THE HUMAN NETWORK & AFFILIATIONS (KUNDALI)",     "yellow"),
+    ("03", "trail",   "THE PAPER TRAIL & MONEY TRAIL",                  "cyan"),
+    ("04", "guns",    "SMOKING GUNS & CONTRADICTIONS",                  "magenta"),
 ]
 
-def render_terminal(target: str, briefing: dict, sources: list[dict], usage):
-    """Pretty-print the briefing to terminal using Rich."""
+CONFIDENCE_ICON = {"high": "[green]●[/green]", "medium": "[yellow]●[/yellow]", "low": "[red]●[/red]"}
+
+def render_terminal(target: str, briefing: dict, sources: list[dict], usage,
+                    show_quotes: bool = False, show_seo: bool = False):
     console.print()
     console.rule("[bold red]DEEP INTELLIGENCE BRIEFING[/bold red]", style="red")
-    console.print(
-        Panel(
-            f"[bold white]ENTITY:[/bold white] {target}\n"
-            f"[dim]Generated: {datetime.now().strftime('%d %b %Y · %H:%M:%S')}  |  "
-            f"Tokens used: {usage.input_tokens} in / {usage.output_tokens} out[/dim]",
-            border_style="red",
-            expand=True,
-        )
-    )
+    confidence = briefing.get("confidence", {})
+    console.print(Panel(
+        f"[bold white]ENTITY:[/bold white] {target}\n"
+        f"[dim]Generated: {datetime.now().strftime('%d %b %Y · %H:%M:%S')}  |  "
+        f"Tokens: {usage.input_tokens} in / {usage.output_tokens} out[/dim]",
+        border_style="red", expand=True,
+    ))
     console.print()
 
     for num, key, title, color in SECTION_META:
-        bullets = briefing.get(key, ["No data found for this section."])
-        console.print(f"[bold {color}]### {num}. {title}[/bold {color}]")
+        conf = confidence.get(key, "medium")
+        conf_badge = CONFIDENCE_ICON.get(conf, "")
+        console.print(f"[bold {color}]### {num}. {title}[/bold {color}]  {conf_badge} [dim]{conf.upper()} CONFIDENCE[/dim]")
         console.print()
-        for bullet in bullets:
-            # Highlight source tags
-            formatted = re.sub(r"\[Source (\d+)\]", r"[dim cyan]\[Source \1\][/dim cyan]", bullet)
-            formatted = formatted.replace(
-                "NO DIRECT PAPER TRAIL FOUND IN CURRENT DATA",
-                "[bold yellow]⚑ NO DIRECT PAPER TRAIL FOUND IN CURRENT DATA[/bold yellow]"
-            )
-            # Word-wrap each bullet
-            wrapped = textwrap.fill(formatted, width=110, subsequent_indent="  ")
+        for bullet in briefing.get(key, ["No data found."]):
+            fmt = re.sub(r"\[Source (\d+)\]", r"[dim cyan]\[Source \1\][/dim cyan]", bullet)
+            fmt = fmt.replace("NO DIRECT DATA FOUND IN CURRENT SOURCES",
+                              "[bold yellow]⚑ NO DIRECT DATA FOUND IN CURRENT SOURCES[/bold yellow]")
+            wrapped = textwrap.fill(fmt, width=110, subsequent_indent="  ")
             console.print(f"  [bold {color}]▸[/bold {color}] {wrapped}")
             console.print()
         console.rule(style="dim")
         console.print()
 
-    # Source table
+    # Needs corroboration
+    needs = briefing.get("needs_corroboration", [])
+    if needs:
+        console.print("[bold yellow]⚠  NEEDS CORROBORATION BEFORE PUBLISHING[/bold yellow]")
+        for item in needs:
+            console.print(f"  [yellow]▸[/yellow] {item}")
+        console.print()
+
+    # Right-of-reply checklist
+    persons = briefing.get("named_persons", [])
+    if persons:
+        console.print("[bold]RIGHT-OF-REPLY CHECKLIST[/bold]  [dim](contact before publishing)[/dim]")
+        for p in persons:
+            console.print(f"  [dim]☐[/dim]  {p}")
+        console.print()
+
+    # Quotes bank
+    if show_quotes:
+        quotes = briefing.get("quotes", [])
+        if quotes:
+            console.print("[bold cyan]QUOTES BANK[/bold cyan]")
+            for q in quotes:
+                direct_tag = "[green](DIRECT)[/green]" if q.get("is_direct") else "[yellow](PARAPHRASE)[/yellow]"
+                console.print(f"  {direct_tag} [bold]{q.get('speaker','Unknown')}[/bold] — {q.get('date','n/d')}")
+                console.print(f"  [italic]\"{q.get('quote','')}\"[/italic]")
+                console.print(f"  [dim]Source: {q.get('source_url','')}[/dim]")
+                console.print()
+
+    # SEO block
+    if show_seo:
+        headlines = briefing.get("headline_variants", {})
+        keywords = briefing.get("keywords", [])
+        console.print("[bold green]SEO & HEADLINES[/bold green]")
+        for variant, label in [("seo","SEO"), ("clickable","Clickable"), ("print","Print"), ("thread_hook","Thread Hook")]:
+            if headlines.get(variant):
+                console.print(f"  [dim]{label}:[/dim] {headlines[variant]}")
+        if keywords:
+            console.print(f"  [dim]Keywords:[/dim] {', '.join(keywords)}")
+        console.print()
+
+    # Sources table
     console.print("[bold]SOURCES SCRAPED[/bold]")
     table = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 2))
     table.add_column("ID", style="cyan", width=6)
-    table.add_column("Domain", style="white", width=30)
+    table.add_column("Type", width=14)
+    table.add_column("Domain", width=28)
     table.add_column("Status", width=14)
     table.add_column("Chars", justify="right", width=8)
-    table.add_column("URL", style="dim", max_width=60)
-
+    table.add_column("URL", style="dim", max_width=55)
     for s in sources:
+        wb = " [dim](wb)[/dim]" if s.get("wayback_used") else ""
         status_str = "[green]OK[/green]" if s["status"] == "ok" else f"[red]{s['status']}[/red]"
         table.add_row(
             f"[{s['index']}]",
-            s["domain"],
+            s.get("source_type","web"),
+            s["domain"] + wb,
             status_str,
             str(s["char_count"]) if s["char_count"] else "—",
             s["url"],
@@ -294,62 +500,197 @@ def render_terminal(target: str, briefing: dict, sources: list[dict], usage):
     console.print()
 
 
-def save_markdown(target: str, briefing: dict, sources: list[dict], output_dir: Path) -> Path:
-    """Save the briefing as a Markdown file."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_target = re.sub(r"[^\w\s-]", "", target).strip().replace(" ", "_")[:40]
-    filename = f"briefing_{safe_target}_{timestamp}.md"
-    filepath = output_dir / filename
+def render_delta(target: str, delta: dict):
+    console.print()
+    console.rule(f"[bold yellow]DELTA REPORT — {target}[/bold yellow]", style="yellow")
+    if not delta:
+        console.print("[green]No changes detected since last run.[/green]")
+        return
+    for key, changes in delta.items():
+        title = next(t for _, k, t, _ in SECTION_META if k == key)
+        if changes["added"]:
+            console.print(f"[bold green]NEW in {title}:[/bold green]")
+            for item in changes["added"]:
+                console.print(f"  [green]+[/green] {item}")
+        if changes["removed"]:
+            console.print(f"[bold red]REMOVED from {title}:[/bold red]")
+            for item in changes["removed"]:
+                console.print(f"  [red]−[/red] {item}")
+        console.print()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE SAVERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_filename(target: str, suffix: str, ext: str, output_dir: Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe = re.sub(r"[^\w\s-]", "", target).strip().replace(" ", "_")[:40]
+    return output_dir / f"{safe}_{suffix}_{ts}.{ext}"
+
+
+def save_briefing_markdown(target: str, briefing: dict, sources: list[dict],
+                            output_dir: Path, include_quotes: bool = False,
+                            include_seo: bool = False) -> Path:
+    filepath = _make_filename(target, "briefing", "md", output_dir)
     lines = [
         f"# DEEP INTELLIGENCE BRIEFING",
-        f"",
-        f"**Entity:** {target}  ",
+        f"", f"**Entity:** {target}  ",
         f"**Generated:** {datetime.now().strftime('%d %b %Y at %H:%M:%S')}  ",
         f"**Classification:** CONFIDENTIAL — FOR RESEARCH USE ONLY",
-        f"",
-        f"---",
-        f"",
+        f"", f"---", f"",
     ]
-
+    confidence = briefing.get("confidence", {})
     for num, key, title, _ in SECTION_META:
-        lines.append(f"## {num}. {title}")
-        lines.append("")
-        for bullet in briefing.get(key, ["No data found."]):
-            lines.append(f"- {bullet}")
-        lines.append("")
-        lines.append("---")
-        lines.append("")
+        conf = confidence.get(key, "medium").upper()
+        lines += [f"## {num}. {title}  *(Confidence: {conf})*", ""]
+        for b in briefing.get(key, ["No data found."]):
+            lines.append(f"- {b}")
+        lines += ["", "---", ""]
 
-    lines.append("## SOURCES")
-    lines.append("")
+    needs = briefing.get("needs_corroboration", [])
+    if needs:
+        lines += ["## ⚠ NEEDS CORROBORATION", ""]
+        for n in needs:
+            lines.append(f"- {n}")
+        lines += ["", "---", ""]
+
+    persons = briefing.get("named_persons", [])
+    if persons:
+        lines += ["## RIGHT-OF-REPLY CHECKLIST", ""]
+        for p in persons:
+            lines.append(f"- [ ] {p}")
+        lines += ["", "---", ""]
+
+    if include_quotes:
+        quotes = briefing.get("quotes", [])
+        if quotes:
+            lines += ["## QUOTES BANK", ""]
+            for q in quotes:
+                tag = "(DIRECT)" if q.get("is_direct") else "(PARAPHRASE)"
+                lines.append(f"### {q.get('speaker','Unknown')} — {q.get('date','n/d')} {tag}")
+                lines.append(f"> {q.get('quote','')}")
+                lines.append(f"*Source: {q.get('source_url','')}*")
+                lines.append("")
+            lines += ["---", ""]
+
+    if include_seo:
+        headlines = briefing.get("headline_variants", {})
+        keywords = briefing.get("keywords", [])
+        lines += ["## SEO & HEADLINES", ""]
+        for k, v in headlines.items():
+            lines.append(f"**{k.upper()}:** {v}")
+        lines.append(f"\n**Keywords:** {', '.join(keywords)}")
+        lines += ["", "---", ""]
+
+    lines += ["## SOURCES", ""]
     for s in sources:
-        status = "✓" if s["status"] == "ok" else "✗"
-        lines.append(f"- **[Source {s['index']}]** {status} [{s['domain']}]({s['url']})")
+        wb = " *(Wayback)*" if s.get("wayback_used") else ""
+        ok = "✓" if s["status"] == "ok" else "✗"
+        lines.append(f"- **[Source {s['index']}]** {ok}{wb} [{s['domain']}]({s['url']})")
         if s["error"]:
             lines.append(f"  - Error: {s['error']}")
-    lines.append("")
-    lines.append("---")
-    lines.append("*This briefing was generated by the OSINT Deep Briefing Bot. All facts are sourced strictly from the provided URLs. Verify independently before publication.*")
+    lines += ["", "---",
+              "*All facts sourced strictly from provided URLs. Verify independently before publication.*"]
 
     filepath.write_text("\n".join(lines), encoding="utf-8")
     return filepath
 
 
-def save_json(target: str, briefing: dict, sources: list[dict], output_dir: Path) -> Path:
-    """Save raw JSON output."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_target = re.sub(r"[^\w\s-]", "", target).strip().replace(" ", "_")[:40]
-    filename = f"briefing_{safe_target}_{timestamp}.json"
-    filepath = output_dir / filename
+def save_article(target: str, content: str, output_dir: Path) -> Path:
+    filepath = _make_filename(target, "article", "txt", output_dir)
+    filepath.write_text(content, encoding="utf-8")
+    return filepath
+
+
+def save_thread(target: str, content: str, output_dir: Path) -> Path:
+    filepath = _make_filename(target, "thread", "txt", output_dir)
+    filepath.write_text(content, encoding="utf-8")
+    return filepath
+
+
+def save_newsletter(target: str, content: str, output_dir: Path) -> Path:
+    filepath = _make_filename(target, "newsletter", "txt", output_dir)
+    filepath.write_text(content, encoding="utf-8")
+    return filepath
+
+
+def save_legal(target: str, content: str, output_dir: Path) -> Path:
+    filepath = _make_filename(target, "legal_review", "txt", output_dir)
+    filepath.write_text(content, encoding="utf-8")
+    return filepath
+
+
+def save_json_output(target: str, briefing: dict, sources: list[dict],
+                     output_dir: Path, redact_sources: bool = False) -> Path:
+    filepath = _make_filename(target, "data", "json", output_dir)
+    src_out = []
+    for s in sources:
+        entry = dict(s)
+        if redact_sources:
+            entry["url"] = hashlib.sha256(s["url"].encode()).hexdigest()[:16] + "...[REDACTED]"
+            entry["text"] = "[REDACTED]"
+        src_out.append(entry)
 
     payload = {
         "target": target,
         "generated_at": datetime.now().isoformat(),
         "briefing": briefing,
-        "sources": sources,
+        "sources": src_out,
     }
     filepath.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return filepath
+
+
+def save_docx(target: str, briefing: dict, sources: list[dict], output_dir: Path) -> Path:
+    """Export briefing as a Word document."""
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document()
+
+    # Title
+    title = doc.add_heading("DEEP INTELLIGENCE BRIEFING", 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = doc.add_paragraph()
+    meta.add_run(f"Entity: ").bold = True
+    meta.add_run(target)
+    meta.add_run(f"\nGenerated: {datetime.now().strftime('%d %B %Y at %H:%M')}")
+    meta.add_run(f"\nClassification: CONFIDENTIAL — FOR RESEARCH USE ONLY").bold = True
+
+    doc.add_paragraph()
+
+    confidence = briefing.get("confidence", {})
+    for num, key, title_str, _ in SECTION_META:
+        conf = confidence.get(key, "medium").upper()
+        h = doc.add_heading(f"{num}. {title_str}  [Confidence: {conf}]", level=1)
+        for b in briefing.get(key, ["No data found."]):
+            p = doc.add_paragraph(b, style="List Bullet")
+
+    # Needs corroboration
+    needs = briefing.get("needs_corroboration", [])
+    if needs:
+        doc.add_heading("⚠ NEEDS CORROBORATION", level=1)
+        for n in needs:
+            doc.add_paragraph(n, style="List Bullet")
+
+    # Persons
+    persons = briefing.get("named_persons", [])
+    if persons:
+        doc.add_heading("RIGHT-OF-REPLY CHECKLIST", level=1)
+        for p in persons:
+            doc.add_paragraph(f"☐  {p}", style="List Bullet")
+
+    # Sources
+    doc.add_heading("SOURCES", level=1)
+    for s in sources:
+        ok = "✓" if s["status"] == "ok" else "✗"
+        doc.add_paragraph(f"{ok} [Source {s['index']}]  {s['domain']}  {s['url']}")
+
+    filepath = _make_filename(target, "briefing", "docx", output_dir)
+    doc.save(str(filepath))
     return filepath
 
 
@@ -359,117 +700,235 @@ def save_json(target: str, briefing: dict, sources: list[dict], output_dir: Path
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="OSINT Deep Briefing Bot — auto-scrape URLs and generate an investigative briefing via Claude.",
+        description="OSINT Deep Briefing Engine — Content Writer Edition",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
         Examples:
-          python osint_bot.py --target "XYZ NGO" --urls https://example.com https://news.com/article
-          python osint_bot.py --target "ABC Media" --file urls.txt
-          python osint_bot.py --target "StartupXYZ" --urls https://crunchbase.com/... --extra "Founded 2021, Delhi"
-          python osint_bot.py --target "PoliticalPage" --urls https://... --json --no-markdown
+          python osint_bot.py --target "XYZ NGO" --urls https://example.com --mode article
+          python osint_bot.py --target "ABC Media" --file urls.txt --angle funding --quotes
+          python osint_bot.py --target "Entity" --urls url1 --seo --legal-review --export docx
+          python osint_bot.py --target "Entity" --watchlist add --urls url1 url2
+          python osint_bot.py --target "Entity" --watchlist run
+          python osint_bot.py --watchlist list
         """),
     )
-    parser.add_argument("--target", required=True, help="Name of the entity being investigated")
-    parser.add_argument("--urls", nargs="+", metavar="URL", help="One or more URLs to scrape")
-    parser.add_argument("--file", metavar="FILE", help="Text file with one URL per line")
-    parser.add_argument("--extra", default="", metavar="TEXT", help="Extra manual context/notes to append")
-    parser.add_argument("--output-dir", default="./output", metavar="DIR", help="Directory to save reports (default: ./output)")
-    parser.add_argument("--api-key", metavar="KEY", help="Anthropic API key (or set ANTHROPIC_API_KEY env var)")
-    parser.add_argument("--json", action="store_true", dest="save_json", help="Also save raw JSON output")
-    parser.add_argument("--no-markdown", action="store_true", help="Skip saving Markdown report")
-    parser.add_argument("--timeout", type=int, default=15, help="Scrape timeout per URL in seconds (default: 15)")
+
+    # Core
+    parser.add_argument("--target", help="Name of the entity being investigated")
+    parser.add_argument("--urls", nargs="+", metavar="URL")
+    parser.add_argument("--file", metavar="FILE")
+    parser.add_argument("--extra", default="", metavar="TEXT")
+
+    # Story controls
+    parser.add_argument("--mode", choices=["briefing", "article", "thread", "newsletter"],
+                        default="briefing",
+                        help="Output mode: briefing (default), article, thread, newsletter")
+    parser.add_argument("--tone", choices=["formal", "tabloid", "academic"], default="formal")
+    parser.add_argument("--angle",
+                        choices=["funding", "founders", "timeline", "contradictions"],
+                        help="Focus the analysis on a specific investigative angle")
+
+    # Enrichments
+    parser.add_argument("--quotes", action="store_true", help="Extract and display quotes bank")
+    parser.add_argument("--seo", action="store_true", help="Generate SEO headlines and keywords")
+    parser.add_argument("--legal-review", action="store_true", dest="legal_review",
+                        help="Run legal compliance pass on the output")
+
+    # Export
+    parser.add_argument("--export", choices=["markdown", "docx", "json", "all"],
+                        default="markdown", help="Export format (default: markdown)")
+    parser.add_argument("--redact-sources", action="store_true", dest="redact_sources",
+                        help="Hash/redact source URLs in JSON output")
+
+    # Watchlist
+    parser.add_argument("--watchlist", choices=["add", "run", "list"],
+                        help="Watchlist management: add entity, re-run entity, or list all")
+
+    # Misc
+    parser.add_argument("--output-dir", default="./output", metavar="DIR")
+    parser.add_argument("--api-key", metavar="KEY")
+    parser.add_argument("--timeout", type=int, default=15)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # ── Banner ────────────────────────────────────────────────────────────────
     console.print()
     console.print(Panel(
-        "[bold red]OSINT DEEP BRIEFING ENGINE[/bold red]\n"
+        "[bold red]OSINT DEEP BRIEFING ENGINE[/bold red]  [dim]· Content Writer Edition ·[/dim]\n"
         "[dim]Investigative Analysis · Follow the Money · Expose the Network[/dim]",
-        border_style="red",
-        expand=False,
+        border_style="red", expand=False,
     ))
     console.print()
 
-    # ── API key ───────────────────────────────────────────────────────────────
+    # API key
     api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
+    if not api_key and args.watchlist != "list":
         console.print("[bold red]ERROR:[/bold red] No API key found.")
-        console.print("Set it via:  [cyan]export ANTHROPIC_API_KEY='sk-ant-...'[/cyan]")
-        console.print("Or pass it:  [cyan]--api-key sk-ant-...[/cyan]")
+        console.print("Set: [cyan]export ANTHROPIC_API_KEY='sk-ant-...'[/cyan]")
+        sys.exit(1)
+
+    client = anthropic.Anthropic(api_key=api_key) if api_key else None
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Watchlist shortcut ────────────────────────────────────────────────────
+    if args.watchlist == "list":
+        watchlist_list()
+        return
+
+    if not args.target:
+        console.print("[red]ERROR:[/red] --target is required.")
         sys.exit(1)
 
     # ── Collect URLs ──────────────────────────────────────────────────────────
     urls = list(args.urls or [])
     if args.file:
-        file_path = Path(args.file)
-        if not file_path.exists():
+        fp = Path(args.file)
+        if not fp.exists():
             console.print(f"[red]ERROR:[/red] File not found: {args.file}")
             sys.exit(1)
-        file_urls = [line.strip() for line in file_path.read_text().splitlines()
-                     if line.strip() and not line.startswith("#")]
-        urls.extend(file_urls)
+        urls += [l.strip() for l in fp.read_text().splitlines()
+                 if l.strip() and not l.startswith("#")]
 
-    if not urls:
-        console.print("[red]ERROR:[/red] No URLs provided. Use --urls or --file.")
-        sys.exit(1)
+    if args.watchlist == "add":
+        if not urls:
+            console.print("[red]ERROR:[/red] Provide --urls when using --watchlist add")
+            sys.exit(1)
+        watchlist_add(args.target, urls)
+        return
 
-    # Deduplicate while preserving order
+    if args.watchlist == "run":
+        wl = watchlist_load()
+        if args.target not in wl:
+            console.print(f"[red]ERROR:[/red] '{args.target}' not in watchlist. Run with --watchlist add first.")
+            sys.exit(1)
+        urls = wl[args.target]["urls"]
+        console.print(f"[dim]Watchlist run for[/dim] [bold]{args.target}[/bold]  ({len(urls)} URLs)")
+
+    # Dedup
     seen = set()
     urls = [u for u in urls if not (u in seen or seen.add(u))]
 
+    if not urls:
+        console.print("[red]ERROR:[/red] No URLs provided.")
+        sys.exit(1)
+
     console.print(f"[bold]Target:[/bold] {args.target}")
-    console.print(f"[bold]URLs:[/bold] {len(urls)} source(s)")
+    console.print(f"[bold]Mode:[/bold] {args.mode}  |  [bold]Tone:[/bold] {args.tone}"
+                  + (f"  |  [bold]Angle:[/bold] {args.angle}" if args.angle else ""))
+    console.print(f"[bold]URLs:[/bold] {len(urls)}")
     for i, u in enumerate(urls):
         console.print(f"  [dim][{i}][/dim] {u}")
     console.print()
 
     # ── Scrape ────────────────────────────────────────────────────────────────
     console.rule("[dim]PHASE 1 — SCRAPING[/dim]")
-    scraped = scrape_all(urls)
-
-    ok_count = sum(1 for s in scraped if s["status"] == "ok")
+    scraped = scrape_all(urls, timeout=args.timeout)
+    ok = sum(1 for s in scraped if s["status"] == "ok")
     total_chars = sum(s["char_count"] for s in scraped)
-    console.print(f"\n[green]✓[/green] Scraped {ok_count}/{len(urls)} sources · {total_chars:,} chars of raw data\n")
+    console.print(f"\n[green]✓[/green] {ok}/{len(urls)} sources · {total_chars:,} chars\n")
 
-    if ok_count == 0:
-        console.print("[bold red]ERROR:[/bold red] All URLs failed to scrape. Check your URLs and internet connection.")
+    wb_used = [s for s in scraped if s.get("wayback_used")]
+    if wb_used:
+        console.print(f"[dim]ℹ  {len(wb_used)} source(s) fetched via Wayback Machine fallback[/dim]")
+
+    if ok == 0:
+        console.print("[bold red]ERROR:[/bold red] All URLs failed to scrape.")
         sys.exit(1)
 
-    # ── Build prompt ──────────────────────────────────────────────────────────
+    # ── Briefing ──────────────────────────────────────────────────────────────
     console.rule("[dim]PHASE 2 — ANALYSIS[/dim]")
-    user_message = build_user_message(args.target, scraped, args.extra)
+    prompt = build_briefing_prompt(args.target, scraped, args.extra, args.angle)
+    briefing, usage = run_briefing(args.target, prompt, client)
 
-    # ── Claude API ────────────────────────────────────────────────────────────
-    try:
-        briefing, usage = run_analysis(args.target, user_message, api_key)
-    except Exception as e:
-        console.print(f"\n[bold red]API ERROR:[/bold red] {e}")
-        sys.exit(1)
+    # ── Mode-specific content generation ─────────────────────────────────────
+    console.rule("[dim]PHASE 3 — CONTENT GENERATION[/dim]")
+    article_text = thread_text = newsletter_text = legal_text = None
 
-    # ── Render to terminal ────────────────────────────────────────────────────
-    console.rule("[dim]PHASE 3 — BRIEFING[/dim]")
-    render_terminal(args.target, briefing, scraped, usage)
+    if args.mode == "article":
+        article_text = run_article(briefing, args.target, args.tone, client)
+    elif args.mode == "thread":
+        thread_text = run_thread(briefing, args.target, client)
+    elif args.mode == "newsletter":
+        newsletter_text = run_newsletter(briefing, args.target, client)
+
+    # Legal review (applies to whatever content was generated)
+    if args.legal_review:
+        content_for_review = article_text or thread_text or newsletter_text or json.dumps(briefing, indent=2)
+        legal_text = run_legal_review(content_for_review, client)
+
+    # ── Terminal output ───────────────────────────────────────────────────────
+    console.rule("[dim]PHASE 4 — OUTPUT[/dim]")
+    render_terminal(args.target, briefing, scraped, usage,
+                    show_quotes=args.quotes, show_seo=args.seo)
+
+    if article_text:
+        console.rule("[bold]ARTICLE DRAFT[/bold]", style="green")
+        console.print(article_text)
+        console.print()
+
+    if thread_text:
+        console.rule("[bold]THREAD[/bold]", style="cyan")
+        console.print(thread_text)
+        console.print()
+
+    if newsletter_text:
+        console.rule("[bold]NEWSLETTER[/bold]", style="magenta")
+        console.print(newsletter_text)
+        console.print()
+
+    if legal_text:
+        console.rule("[bold yellow]LEGAL REVIEW[/bold yellow]", style="yellow")
+        console.print(legal_text)
+        console.print()
+
+    # ── Watchlist delta ───────────────────────────────────────────────────────
+    if args.watchlist == "run":
+        wl = watchlist_load()
+        runs = wl[args.target].get("runs", [])
+        if runs:
+            prev_briefing = runs[-1].get("briefing", {})
+            delta = compute_delta(prev_briefing, briefing)
+            render_delta(args.target, delta)
+        runs.append({"at": datetime.now().isoformat(), "briefing": briefing})
+        wl[args.target]["runs"] = runs[-10:]  # keep last 10 runs
+        watchlist_save(wl)
 
     # ── Save files ────────────────────────────────────────────────────────────
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    saved_files = []
+    saved = []
+    export = args.export
 
-    if not args.no_markdown:
-        md_path = save_markdown(args.target, briefing, scraped, output_dir)
-        saved_files.append(("Markdown Report", md_path))
+    if export in ("markdown", "all"):
+        p = save_briefing_markdown(args.target, briefing, scraped, output_dir,
+                                   include_quotes=args.quotes, include_seo=args.seo)
+        saved.append(("Markdown Briefing", p))
 
-    if args.save_json:
-        json_path = save_json(args.target, briefing, scraped, output_dir)
-        saved_files.append(("JSON Data", json_path))
+    if export in ("json", "all"):
+        p = save_json_output(args.target, briefing, scraped, output_dir,
+                             redact_sources=args.redact_sources)
+        saved.append(("JSON Data", p))
 
-    if saved_files:
+    if export in ("docx", "all"):
+        try:
+            p = save_docx(args.target, briefing, scraped, output_dir)
+            saved.append(("Word Document", p))
+        except ImportError:
+            console.print("[yellow]⚠[/yellow]  python-docx not installed — skipping .docx export")
+
+    if article_text:
+        saved.append(("Article Draft", save_article(args.target, article_text, output_dir)))
+    if thread_text:
+        saved.append(("Thread", save_thread(args.target, thread_text, output_dir)))
+    if newsletter_text:
+        saved.append(("Newsletter", save_newsletter(args.target, newsletter_text, output_dir)))
+    if legal_text:
+        saved.append(("Legal Review", save_legal(args.target, legal_text, output_dir)))
+
+    if saved:
         console.print("[bold]Files saved:[/bold]")
-        for label, path in saved_files:
+        for label, path in saved:
             console.print(f"  [green]✓[/green] {label}: [cyan]{path.resolve()}[/cyan]")
         console.print()
 
