@@ -21,7 +21,6 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
-import anthropic
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
@@ -30,6 +29,104 @@ from rich.rule import Rule
 from rich import print as rprint
 
 console = Console()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROVIDER REGISTRY  (add new providers here)
+# ─────────────────────────────────────────────────────────────────────────────
+
+PROVIDERS = {
+    "claude": {
+        "name": "Anthropic Claude",
+        "env_key": "ANTHROPIC_API_KEY",
+        "model": "claude-opus-4-5",
+        "free": False,
+        "get_key_url": "https://console.anthropic.com → API Keys",
+    },
+    "groq": {
+        "name": "Groq (FREE ✓)",
+        "env_key": "GROQ_API_KEY",
+        "model": "llama-3.3-70b-versatile",
+        "free": True,
+        "get_key_url": "https://console.groq.com → API Keys  (no credit card needed)",
+    },
+    "gemini": {
+        "name": "Google Gemini (FREE ✓)",
+        "env_key": "GEMINI_API_KEY",
+        "model": "gemini-2.5-flash",
+        "free": True,
+        "get_key_url": "https://aistudio.google.com/app/apikey  (no credit card needed)",
+    },
+    "openai": {
+        "name": "OpenAI GPT-4o",
+        "env_key": "OPENAI_API_KEY",
+        "model": "gpt-4o",
+        "free": False,
+        "get_key_url": "https://platform.openai.com/api-keys",
+    },
+}
+
+
+class UsageFake:
+    """Dummy usage object for providers that don't return token counts."""
+    def __init__(self):
+        self.input_tokens = "n/a"
+        self.output_tokens = "n/a"
+
+
+def call_llm(system: str, user: str, provider: str, api_key: str,
+             max_tokens: int = 4096) -> tuple[str, object]:
+    """Universal LLM caller — routes to the right provider SDK."""
+
+    if provider == "claude":
+        import anthropic as _ant
+        client = _ant.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model=PROVIDERS["claude"]["model"],
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        text = "".join(b.text for b in msg.content if hasattr(b, "text"))
+        return text, msg.usage
+
+    elif provider == "groq":
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+        resp = client.chat.completions.create(
+            model=PROVIDERS["groq"]["model"],
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        return resp.choices[0].message.content, UsageFake()
+
+    elif provider == "gemini":
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name=PROVIDERS["gemini"]["model"],
+            system_instruction=system,
+        )
+        resp = model.generate_content(user)
+        return resp.text, UsageFake()
+
+    elif provider == "openai":
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(
+            model=PROVIDERS["openai"]["model"],
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        return resp.choices[0].message.content, UsageFake()
+
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SYSTEM PROMPTS
@@ -285,18 +382,6 @@ def build_briefing_prompt(target: str, scraped: list[dict], extra: str,
     return "\n".join(lines)
 
 
-def call_claude(system: str, user: str, client: anthropic.Anthropic,
-                max_tokens: int = 4096) -> tuple[str, object]:
-    msg = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    text = "".join(b.text for b in msg.content if hasattr(b, "text"))
-    return text, msg.usage
-
-
 def parse_json_response(raw: str) -> dict:
     clean = re.sub(r"```json|```", "", raw).strip()
     try:
@@ -308,40 +393,41 @@ def parse_json_response(raw: str) -> dict:
         raise ValueError(f"Could not parse JSON.\nRaw (first 500):\n{clean[:500]}")
 
 
-def run_briefing(target: str, prompt: str, client: anthropic.Anthropic) -> tuple[dict, object]:
-    console.print("\n[bold red]◌[/bold red] Phase 2 — Analysing with Claude...", end=" ")
-    raw, usage = call_claude(BRIEFING_SYSTEM, prompt, client)
+def run_briefing(target: str, prompt: str, provider: str, api_key: str) -> tuple[dict, object]:
+    pname = PROVIDERS[provider]["name"]
+    console.print(f"\n[bold red]◌[/bold red] Analysing with {pname}...", end=" ")
+    raw, usage = call_llm(BRIEFING_SYSTEM, prompt, provider, api_key)
     console.print("[green]DONE[/green]")
     return parse_json_response(raw), usage
 
 
-def run_article(briefing: dict, target: str, tone: str, client: anthropic.Anthropic) -> str:
+def run_article(briefing: dict, target: str, tone: str, provider: str, api_key: str) -> str:
     console.print("[bold red]◌[/bold red] Drafting article...", end=" ")
     user = f"TARGET: {target}\nTONE: {tone}\n\nBRIEFING JSON:\n{json.dumps(briefing, indent=2)}"
-    raw, _ = call_claude(ARTICLE_SYSTEM, user, client, max_tokens=3000)
+    raw, _ = call_llm(ARTICLE_SYSTEM, user, provider, api_key, max_tokens=3000)
     console.print("[green]DONE[/green]")
     return raw
 
 
-def run_thread(briefing: dict, target: str, client: anthropic.Anthropic) -> str:
+def run_thread(briefing: dict, target: str, provider: str, api_key: str) -> str:
     console.print("[bold red]◌[/bold red] Writing thread...", end=" ")
     user = f"TARGET: {target}\n\nBRIEFING JSON:\n{json.dumps(briefing, indent=2)}"
-    raw, _ = call_claude(THREAD_SYSTEM, user, client, max_tokens=2000)
+    raw, _ = call_llm(THREAD_SYSTEM, user, provider, api_key, max_tokens=2000)
     console.print("[green]DONE[/green]")
     return raw
 
 
-def run_newsletter(briefing: dict, target: str, client: anthropic.Anthropic) -> str:
+def run_newsletter(briefing: dict, target: str, provider: str, api_key: str) -> str:
     console.print("[bold red]◌[/bold red] Writing newsletter...", end=" ")
     user = f"TARGET: {target}\n\nBRIEFING JSON:\n{json.dumps(briefing, indent=2)}"
-    raw, _ = call_claude(NEWSLETTER_SYSTEM, user, client, max_tokens=2500)
+    raw, _ = call_llm(NEWSLETTER_SYSTEM, user, provider, api_key, max_tokens=2500)
     console.print("[green]DONE[/green]")
     return raw
 
 
-def run_legal_review(content: str, client: anthropic.Anthropic) -> str:
+def run_legal_review(content: str, provider: str, api_key: str) -> str:
     console.print("[bold red]◌[/bold red] Legal compliance review...", end=" ")
-    raw, _ = call_claude(LEGAL_SYSTEM, content, client, max_tokens=3000)
+    raw, _ = call_llm(LEGAL_SYSTEM, content, provider, api_key, max_tokens=3000)
     console.print("[green]DONE[/green]")
     return raw
 
@@ -703,15 +789,29 @@ def parse_args():
         description="OSINT Deep Briefing Engine — Content Writer Edition",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
+        FREE providers (no credit card needed):
+          groq    → console.groq.com        (Llama 3.3 70B, very fast)
+          gemini  → aistudio.google.com     (Gemini 2.5 Flash)
+
+        Paid providers:
+          claude  → console.anthropic.com   (Claude Opus — best quality)
+          openai  → platform.openai.com     (GPT-4o)
+
         Examples:
-          python osint_bot.py --target "XYZ NGO" --urls https://example.com --mode article
-          python osint_bot.py --target "ABC Media" --file urls.txt --angle funding --quotes
-          python osint_bot.py --target "Entity" --urls url1 --seo --legal-review --export docx
+          python osint_bot.py --target "XYZ NGO" --urls https://example.com --provider groq
+          python osint_bot.py --target "ABC Media" --file urls.txt --provider gemini --mode article
+          python osint_bot.py --target "Entity" --urls url1 --provider groq --seo --quotes
           python osint_bot.py --target "Entity" --watchlist add --urls url1 url2
-          python osint_bot.py --target "Entity" --watchlist run
-          python osint_bot.py --watchlist list
+          python osint_bot.py --target "Entity" --watchlist run --provider groq
+          python osint_bot.py --providers   (list all providers and how to get keys)
         """),
     )
+
+    # Provider
+    parser.add_argument("--provider", choices=list(PROVIDERS.keys()), default="groq",
+                        help="AI provider (default: groq — FREE, no credit card)")
+    parser.add_argument("--providers", action="store_true",
+                        help="List all available providers and quit")
 
     # Core
     parser.add_argument("--target", help="Name of the entity being investigated")
@@ -746,9 +846,28 @@ def parse_args():
 
     # Misc
     parser.add_argument("--output-dir", default="./output", metavar="DIR")
-    parser.add_argument("--api-key", metavar="KEY")
+    parser.add_argument("--api-key", metavar="KEY",
+                        help="API key (or set env var per provider — see --providers)")
     parser.add_argument("--timeout", type=int, default=15)
     return parser.parse_args()
+
+
+def show_providers():
+    console.print()
+    t = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+    t.add_column("Flag", style="cyan", width=10)
+    t.add_column("Provider", width=22)
+    t.add_column("Model", width=28)
+    t.add_column("Free?", width=8)
+    t.add_column("Get your key at", style="dim")
+    for flag, p in PROVIDERS.items():
+        free = "[green]YES ✓[/green]" if p["free"] else "[yellow]Paid[/yellow]"
+        t.add_row(flag, p["name"], p["model"], free, p["get_key_url"])
+    console.print(t)
+    console.print()
+    console.print("[dim]Set key as env var, e.g.:  export GROQ_API_KEY='gsk_...'[/dim]")
+    console.print("[dim]Or pass inline:            --api-key gsk_...[/dim]")
+    console.print()
 
 
 def main():
@@ -762,14 +881,24 @@ def main():
     ))
     console.print()
 
-    # API key
-    api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    if args.providers:
+        show_providers()
+        return
+
+    # ── Resolve provider & API key ────────────────────────────────────────────
+    provider = args.provider
+    pinfo = PROVIDERS[provider]
+    api_key = args.api_key or os.environ.get(pinfo["env_key"], "")
+
     if not api_key and args.watchlist != "list":
-        console.print("[bold red]ERROR:[/bold red] No API key found.")
-        console.print("Set: [cyan]export ANTHROPIC_API_KEY='sk-ant-...'[/cyan]")
+        console.print(f"[bold red]ERROR:[/bold red] No API key found for provider [bold]{provider}[/bold].")
+        console.print(f"  Get a free key at: [cyan]{pinfo['get_key_url']}[/cyan]")
+        console.print(f"  Then set it:       [cyan]export {pinfo['env_key']}='your-key-here'[/cyan]")
+        console.print(f"  Or pass inline:    [cyan]--api-key your-key-here[/cyan]")
+        console.print()
+        console.print("Run [cyan]python osint_bot.py --providers[/cyan] to see all options.")
         sys.exit(1)
 
-    client = anthropic.Anthropic(api_key=api_key) if api_key else None
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -816,7 +945,7 @@ def main():
         sys.exit(1)
 
     console.print(f"[bold]Target:[/bold] {args.target}")
-    console.print(f"[bold]Mode:[/bold] {args.mode}  |  [bold]Tone:[/bold] {args.tone}"
+    console.print(f"[bold]Provider:[/bold] {pinfo['name']}  |  [bold]Mode:[/bold] {args.mode}  |  [bold]Tone:[/bold] {args.tone}"
                   + (f"  |  [bold]Angle:[/bold] {args.angle}" if args.angle else ""))
     console.print(f"[bold]URLs:[/bold] {len(urls)}")
     for i, u in enumerate(urls):
@@ -841,23 +970,23 @@ def main():
     # ── Briefing ──────────────────────────────────────────────────────────────
     console.rule("[dim]PHASE 2 — ANALYSIS[/dim]")
     prompt = build_briefing_prompt(args.target, scraped, args.extra, args.angle)
-    briefing, usage = run_briefing(args.target, prompt, client)
+    briefing, usage = run_briefing(args.target, prompt, provider, api_key)
 
     # ── Mode-specific content generation ─────────────────────────────────────
     console.rule("[dim]PHASE 3 — CONTENT GENERATION[/dim]")
     article_text = thread_text = newsletter_text = legal_text = None
 
     if args.mode == "article":
-        article_text = run_article(briefing, args.target, args.tone, client)
+        article_text = run_article(briefing, args.target, args.tone, provider, api_key)
     elif args.mode == "thread":
-        thread_text = run_thread(briefing, args.target, client)
+        thread_text = run_thread(briefing, args.target, provider, api_key)
     elif args.mode == "newsletter":
-        newsletter_text = run_newsletter(briefing, args.target, client)
+        newsletter_text = run_newsletter(briefing, args.target, provider, api_key)
 
     # Legal review (applies to whatever content was generated)
     if args.legal_review:
         content_for_review = article_text or thread_text or newsletter_text or json.dumps(briefing, indent=2)
-        legal_text = run_legal_review(content_for_review, client)
+        legal_text = run_legal_review(content_for_review, provider, api_key)
 
     # ── Terminal output ───────────────────────────────────────────────────────
     console.rule("[dim]PHASE 4 — OUTPUT[/dim]")
